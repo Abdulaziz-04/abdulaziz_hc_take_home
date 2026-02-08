@@ -105,13 +105,6 @@ ABDULAZIZ_HC_TAKE_HOME/
 
 **Goal**: Scrape job listings from detected endpoints with intelligent duplicate handling
 
-**Core Architecture**:
+- Ended up retrieving 5,630 jobs in total after deduplicating out of 46,000 jobs
+- I had retrieved 15,000 jobs earlier with job desciptions, I am not sure what happened in the workflow and I was unable to recreate it effectively.
 
-#### 1. Dual Scraping Strategies
-
-**JSON API Scraping** (`scrape_via_json_api()`):
-```python
-# Handles JSON endpoints like PublicReports and SearchJobs JSON
-- Request pagination: jobOffset + jobRecords
-- Response parsing: Flexible JSON structure detection
-- Job extraction: Multiple field name variations (id/jobId/Id)
