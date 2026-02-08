@@ -262,7 +262,7 @@ def try_json_api(tenant, endpoint, offset=0, limit=50):
         try:
             response = requests.get(
                 api_url,
-                headers={**HEADERS, "Accept": "application/json"},
+                headers={**HEADERS},
                 timeout=REQUEST_TIMEOUT,
                 allow_redirects=True,
             )
@@ -293,12 +293,14 @@ def scrape_via_json_api(
     tenant, api_url_template, pagination_param, page_size_param, page_size
 ):
     """
-    Scrape using JSON API
+    Scrape using JSON API with duplicate detection
     """
+    import time
 
     jobs = []
     page = 0
     consecutive_empty = 0
+    seen_job_ids = set()  # ← Track all job IDs we've seen
 
     while page < MAX_PAGES_PER_SITE:
         offset = page * page_size
@@ -318,7 +320,7 @@ def scrape_via_json_api(
         try:
             response = requests.get(
                 api_url,
-                headers={**HEADERS, "Accept": "application/json"},
+                headers={**HEADERS},
                 timeout=REQUEST_TIMEOUT,
             )
 
@@ -326,7 +328,6 @@ def scrape_via_json_api(
                 break
 
             data = response.json()
-
             page_jobs = []
             jobs_list = []
 
@@ -348,30 +349,59 @@ def scrape_via_json_api(
                 else api_url.rsplit("/", 1)[0]
             )
 
+            # Track duplicates on THIS page
+            page_duplicates = 0
+            page_new_jobs = 0
+
             for job_obj in jobs_list:
                 job_data = parse_job_from_json(job_obj, tenant, base_url)
                 if job_data:
-                    page_jobs.append(job_data)
+                    job_id = job_data.get("job_id")
 
-            if not page_jobs:
+                    # Check if we've seen this job before
+                    if job_id and job_id in seen_job_ids:
+                        page_duplicates += 1
+                        continue  # Skip duplicate
+
+                    # New job - add it
+                    if job_id:
+                        seen_job_ids.add(job_id)
+                    page_jobs.append(job_data)
+                    page_new_jobs += 1
+
+            # If >80% of jobs on this page are duplicates, stop
+            if len(jobs_list) > 0:
+                duplicate_rate = page_duplicates / len(jobs_list)
+                if duplicate_rate > 0.8:
+                    logger.warning(
+                        f"{tenant}: Page {page+1} has {duplicate_rate*100:.0f}% duplicates - "
+                        f"API not respecting pagination, stopping"
+                    )
+                    break
+
+            # If NO new jobs found, increment empty counter
+            if page_new_jobs == 0:
                 consecutive_empty += 1
                 if consecutive_empty >= 2:
+                    logger.info(f"{tenant}: No new jobs for 2 pages, stopping")
                     break
             else:
                 consecutive_empty = 0
-                jobs.extend(page_jobs)
-                logger.info(
-                    f"  {tenant}: Page {page+1} - {len(page_jobs)} jobs (total: {len(jobs)})"
-                )
+
+            jobs.extend(page_jobs)
+            logger.info(
+                f"{tenant}: Page {page+1} - {page_new_jobs} new jobs, "
+                f"{page_duplicates} duplicates (total: {len(jobs)})"
+            )
 
             page += 1
-            time.sleep(0.5)
+            time.sleep(random.uniform(2.0, 4.0))  # Increased delay
 
         except Exception as e:
-            logger.error(f"  {tenant}: API error on page {page} - {e}")
+            logger.error(f"{tenant}: API error on page {page} - {e}")
             break
 
-    logger.info(f"{tenant}: Collected {len(jobs)} jobs via JSON API")
+    logger.info(f"{tenant}: Collected {len(jobs)} unique jobs via JSON API")
     return jobs
 
 
@@ -379,12 +409,14 @@ def scrape_via_html_parsing(
     tenant, endpoint, pagination_param, page_size_param, page_size
 ):
     """
-    Scrape using HTML parsing with fixed element detection
+    Scrape using HTML parsing with duplicate detection
     """
+    import time
 
     jobs = []
     page = 0
     consecutive_empty = 0
+    seen_job_ids = set()
 
     while page < MAX_PAGES_PER_SITE:
         offset = page * page_size
@@ -396,36 +428,41 @@ def scrape_via_html_parsing(
                 url, headers=HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=True
             )
 
-            # Check for auth redirects
-            if any(
-                blocked in response.url.lower()
-                for blocked in ["login", "signin", "facebook", "linkedin", "auth"]
-            ):
-                logger.warning(f"  {tenant}: Redirected to auth")
-                break
-
-            if response.status_code != 200:
-                logger.warning(f"  {tenant}: HTTP {response.status_code}")
-                break
-
             soup = BeautifulSoup(response.content, "html.parser")
-
             job_elements = find_job_elements(soup)
 
             if not job_elements:
                 consecutive_empty += 1
                 if consecutive_empty >= 2:
-                    logger.info(f"  {tenant}: No more jobs at page {page}")
+                    logger.info(f"{tenant}: No more jobs at page {page}")
                     break
                 page += 1
-                time.sleep(0.5)
+                time.sleep(random.uniform(2.0, 4.0))
                 continue
 
             page_jobs = []
+            page_duplicates = 0  # ← Add this
+
             for job_elem in job_elements:
                 job_data = parse_job_from_listing(job_elem, endpoint, tenant)
                 if job_data:
+                    job_id = job_data.get("job_id")
+
+                    # Check for duplicates
+                    if job_id and job_id in seen_job_ids:
+                        page_duplicates += 1
+                        continue
+
+                    if job_id:
+                        seen_job_ids.add(job_id)
                     page_jobs.append(job_data)
+
+            # Stop if mostly duplicates
+            if len(job_elements) > 0 and page_duplicates / len(job_elements) > 0.8:
+                logger.warning(
+                    f"{tenant}: Page {page+1} has {page_duplicates}/{len(job_elements)} duplicates, stopping"
+                )
+                break
 
             if not page_jobs:
                 consecutive_empty += 1
@@ -433,19 +470,21 @@ def scrape_via_html_parsing(
                     break
             else:
                 consecutive_empty = 0
-                jobs.extend(page_jobs)
-                logger.info(
-                    f"  {tenant}: Page {page+1} - {len(page_jobs)} jobs (total: {len(jobs)})"
-                )
+
+            jobs.extend(page_jobs)
+            logger.info(
+                f"{tenant}: Page {page+1} - {len(page_jobs)} new jobs, "
+                f"{page_duplicates} duplicates (total: {len(jobs)})"
+            )
 
             page += 1
-            time.sleep(0.5)
+            time.sleep(random.uniform(2.0, 4.0))
 
         except Exception as e:
-            logger.error(f"  {tenant}: Error on page {page} - {e}")
+            logger.error(f"{tenant}: Error on page {page} - {e}")
             break
 
-    logger.info(f"{tenant}: Collected {len(jobs)} jobs via HTML")
+    logger.info(f"{tenant}: Collected {len(jobs)} unique jobs via HTML")
     return jobs
 
 
@@ -530,14 +569,16 @@ def scrape_partial_endpoint(config):
             if location_elem:
                 job_data["location"] = clean_text(location_elem.get_text())
 
-            desc_elem = soup.find(class_=re.compile("description|content", re.I))
+            desc_elem = soup.find(
+                class_=re.compile("description|content|summary|details", re.I)
+            )
             if desc_elem:
                 job_data["job_description"] = clean_text(desc_elem.get_text())
 
             if job_data["job_title"]:
                 jobs.append(job_data)
 
-            time.sleep(0.5)
+            time.sleep(random.uniform(2.0, 4.0))
 
         except Exception as e:
             logger.debug(f"Error scraping job {job_id}: {e}")
